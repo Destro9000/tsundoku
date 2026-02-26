@@ -1,0 +1,155 @@
+package eu.kanade.tachiyomi.data.export
+
+import android.content.Context
+import android.net.Uri
+import eu.kanade.tachiyomi.source.model.SManga
+import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import tachiyomi.domain.library.model.LibraryManga
+import tachiyomi.domain.manga.model.Manga
+import tachiyomi.domain.manga.repository.MangaRepository
+import tachiyomi.domain.source.service.SourceManager
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
+
+object LibraryExporter {
+
+    data class ExportOptions(
+        val includeTitle: Boolean,
+        val includeAuthor: Boolean,
+        val includeArtist: Boolean,
+        val includeUrl: Boolean = false,
+        val includeChapterCount: Boolean = false,
+        val includeCategory: Boolean = false,
+        val includeIsNovel: Boolean = false,
+        val includeDescription: Boolean = false,
+        val includeTags: Boolean = false,
+    )
+
+    data class ExportProgress(
+        val current: Int,
+        val total: Int,
+        val currentTitle: String = "",
+    )
+
+    suspend fun exportToCsv(
+        context: Context,
+        uri: Uri,
+        favorites: List<Manga>,
+        options: ExportOptions,
+        onProgress: (ExportProgress) -> Unit = {},
+        onExportComplete: () -> Unit,
+    ) {
+        withContext(Dispatchers.IO) {
+            context.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                outputStream.bufferedWriter().use { writer ->
+                    writeCsvData(writer, favorites, options, onProgress)
+                }
+            }
+            onExportComplete()
+        }
+    }
+
+    private val escapeRequired = listOf("\r", "\n", "\"", ",")
+
+    private suspend fun writeCsvData(
+        writer: java.io.Writer,
+        favorites: List<Manga>,
+        options: ExportOptions,
+        onProgress: (ExportProgress) -> Unit = {},
+    ) {
+        val sourceManager = Injekt.get<SourceManager>()
+        val mangaRepo = Injekt.get<MangaRepository>()
+        val getCategories = Injekt.get<tachiyomi.domain.category.interactor.GetCategories>()
+
+        // Pre-fetch library entries and category names
+        val libraryMap: Map<Long, tachiyomi.domain.library.model.LibraryManga> = try {
+            mangaRepo.getLibraryManga().associateBy { it.manga.id }
+        } catch (_: Exception) {
+            emptyMap()
+        }
+
+        val categoryIdToName: Map<Long, String> = try {
+            getCategories.await().associate { it.id to it.name }
+        } catch (_: Exception) {
+            emptyMap()
+        }
+
+        val columns = mutableListOf<String>()
+        if (options.includeTitle) columns.add("Title")
+        if (options.includeAuthor) columns.add("Author")
+        if (options.includeArtist) columns.add("Artist")
+        if (options.includeCategory) columns.add("Categories")
+        if (options.includeIsNovel) columns.add("Is Novel")
+        if (options.includeDescription) columns.add("Description")
+        if (options.includeTags) columns.add("Tags")
+        if (options.includeUrl) columns.add("URL")
+        if (options.includeChapterCount) columns.add("Chapter Count")
+
+        writer.appendLine(columns.joinToString(","))
+
+        val total = favorites.size
+        favorites.forEachIndexed { index, manga ->
+            // Report progress
+            onProgress(ExportProgress(index + 1, total, manga.title))
+
+            val row = mutableListOf<String?>()
+            if (options.includeTitle) row.add(manga.title)
+            if (options.includeAuthor) row.add(manga.author)
+            if (options.includeArtist) row.add(manga.artist)
+
+            if (options.includeCategory) {
+                val lib = libraryMap[manga.id]
+                val catNames = lib?.categories?.mapNotNull { categoryIdToName[it] }?.joinToString("|") ?: ""
+                row.add(catNames)
+            }
+
+            if (options.includeIsNovel) {
+                row.add(if (manga.isNovel) "Yes" else "No")
+            }
+
+            if (options.includeDescription) {
+                row.add(manga.description?.take(5000) ?: "")
+            }
+
+            if (options.includeTags) {
+                // Tags are comma-separated within quotes
+                val tags = manga.genre?.joinToString(", ") ?: ""
+                row.add(tags)
+            }
+
+            if (options.includeUrl) {
+                val fullUrl = try {
+                    val source = sourceManager.get(manga.source) as? HttpSource
+                    if (source != null) {
+                        val sManga = SManga.create().apply { url = manga.url }
+                        source.getMangaUrl(sManga)
+                    } else {
+                        manga.url
+                    }
+                } catch (_: Exception) {
+                    manga.url
+                }
+                row.add(fullUrl)
+            }
+
+            if (options.includeChapterCount) {
+                val count = libraryMap[manga.id]?.totalChapters?.toString() ?: ""
+                row.add(count)
+            }
+
+            writer.appendLine(
+                row.joinToString(",") { column ->
+                    if (column.isNullOrBlank()) {
+                        ""
+                    } else if (escapeRequired.any { column.contains(it) }) {
+                        column.replace("\"", "\"\"").let { "\"$it\"" }
+                    } else {
+                        column
+                    }
+                },
+            )
+        }
+    }
+}
